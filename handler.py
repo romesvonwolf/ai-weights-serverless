@@ -347,21 +347,23 @@ def _run_unirig(in_glb, work, timeout):
     # 0.71 in the fbx vs 0.21 in our mesh), which scrambled the NN transfer.
     # UniRig's own merge reads predict_skin.npz instead: `vertices` is the
     # faithfully sampled (uniform-normalized) cloud and `skin` is (N,J) for it.
-    # raw_data.npz carries the joint NAMES in skin-column order.
-    predict_skin = _newest(
-        os.path.join(UNIRIG_DIR, "results", "**", "predict_skin.npz"),
-        os.path.join(UNIRIG_DIR, "**", "predict_skin.npz"),
-    )
-    raw_data = _newest(
-        os.path.join(UNIRIG_DIR, "tmp", "**", "raw_data.npz"),
-        os.path.join(UNIRIG_DIR, "**", "raw_data.npz"),
-    )
+    # raw_data.npz carries the joint NAMES in skin-column order. The npz can land
+    # in a few places (results/ or tmp/ under UniRig, or beside the input in our
+    # work dir), so search a broad set of roots and take the newest match.
+    roots = [work, os.path.dirname(in_glb), UNIRIG_DIR, os.getcwd(), "/tmp"]
+    def find(name):
+        return _newest(*[os.path.join(r, "**", name) for r in roots if r])
+    predict_skin = find("predict_skin.npz")
+    raw_data = find("raw_data.npz")
     if not predict_skin or not raw_data:
-        found = "\n".join(glob.glob(os.path.join(UNIRIG_DIR, "results", "**", "*.npz"), recursive=True)[:20]
-                          + glob.glob(os.path.join(UNIRIG_DIR, "tmp", "**", "*.npz"), recursive=True)[:20])
+        listing = []
+        for r in roots:
+            if r:
+                listing += glob.glob(os.path.join(r, "**", "*.npz"), recursive=True)
+        listing = "\n".join(sorted(set(listing))[:40]) or "(no .npz anywhere)"
         raise RuntimeError(
             f"UniRig npz outputs not found (predict_skin={predict_skin}, raw_data={raw_data}).\n"
-            f"--- *.npz under results/ and tmp/ ---\n{found}"
+            f"--- *.npz under {roots} ---\n{listing}"
         )
     return {"predict_skin": predict_skin, "raw_data": raw_data}, "AI_UNIRIG"
 
