@@ -15,6 +15,7 @@ Output JSON:
 The caller NN-transfers these (in normalized space) onto our full-res mesh, so
 the absolute coordinate frame here does not matter — only relative geometry.
 """
+import os
 import sys
 import json
 import bpy
@@ -81,3 +82,9 @@ def read(result_path, out_json):
 
 if __name__ == "__main__":
     read(sys.argv[1], sys.argv[2])
+    # bpy 4.x reliably SIGSEGVs (exit -11) during Python interpreter teardown on
+    # headless workers. The JSON is already fully written above, so flush our
+    # logs and hard-exit 0 to stop that bogus crash being treated as a failure.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

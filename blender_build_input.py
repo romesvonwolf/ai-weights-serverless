@@ -11,6 +11,7 @@ The armature carries OUR bone names so the predicted skin weights round-trip
 back to the same names. The mesh is bound to the armature (empty groups) so the
 glTF exporter writes a skinned skeleton the extractor can read.
 """
+import os
 import sys
 import json
 import bpy
@@ -86,3 +87,9 @@ def build(mesh_json, out_glb):
 
 if __name__ == "__main__":
     build(sys.argv[1], sys.argv[2])
+    # bpy 4.x reliably SIGSEGVs (exit -11) during Python interpreter teardown on
+    # headless workers. The GLB is already fully written above, so flush our logs
+    # and hard-exit 0 to stop that bogus crash being treated as a build failure.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

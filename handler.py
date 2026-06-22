@@ -191,13 +191,24 @@ def _densify_topk_normalize(dense, names, prune=0.02, top_k=4):
 # --------------------------------------------------------------------------- #
 # Model drivers
 # --------------------------------------------------------------------------- #
-def _run(cmd, cwd=None, timeout=1800, env=None):
+def _run(cmd, cwd=None, timeout=1800, env=None, expect=None):
     print(f"[ai-weights] $ {' '.join(cmd)} (cwd={cwd})", flush=True)
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
     if proc.stdout:
         print(proc.stdout[-4000:], flush=True)
     if proc.returncode != 0:
         print(proc.stderr[-4000:], flush=True)
+        # Tools that embed Blender's `bpy` (our helpers and UniRig's extractor)
+        # can SIGSEGV (-11) during interpreter teardown AFTER fully writing their
+        # output. Treat a non-zero exit as success when the expected artifact
+        # actually exists and is non-empty.
+        if expect and os.path.exists(expect) and os.path.getsize(expect) > 0:
+            print(
+                f"[ai-weights] WARN: exit {proc.returncode} but {expect} "
+                f"exists ({os.path.getsize(expect)} bytes) — continuing",
+                flush=True,
+            )
+            return proc
         raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stderr[-1500:]}")
     return proc
 
@@ -208,7 +219,7 @@ def _run_unirig(in_glb, work, timeout):
         ["bash", "launch/inference/generate_skin.sh",
          "--input", in_glb, "--output", out_fbx,
          "--faces_target_count", str(FACES_TARGET)],
-        cwd=UNIRIG_DIR, timeout=timeout,
+        cwd=UNIRIG_DIR, timeout=timeout, expect=out_fbx,
     )
     if not os.path.exists(out_fbx):
         raise RuntimeError("UniRig produced no skin.fbx")
@@ -220,7 +231,7 @@ def _run_skintokens(in_glb, work, timeout):
     _run(
         [PYBIN, "demo.py", "--input", in_glb, "--output", out_glb,
          "--use_skeleton", "--use_transfer"],
-        cwd=SKINTOKENS_DIR, timeout=timeout,
+        cwd=SKINTOKENS_DIR, timeout=timeout, expect=out_glb,
     )
     if not os.path.exists(out_glb):
         raise RuntimeError("SkinTokens produced no skin.glb")
@@ -253,7 +264,7 @@ def compute(data, model, timeout):
         # 2. build input GLB (mesh + armature) via Blender (bpy subprocess)
         in_glb = os.path.join(work, "input.glb")
         t_build = time.time()
-        _run([PYBIN, os.path.join(HERE, "blender_build_input.py"), mesh_json, in_glb], timeout=600)
+        _run([PYBIN, os.path.join(HERE, "blender_build_input.py"), mesh_json, in_glb], timeout=600, expect=in_glb)
         build_s = round(time.time() - t_build, 2)
 
         # 3. run the chosen skinning model
@@ -266,7 +277,7 @@ def compute(data, model, timeout):
 
         # 4. read skinned result → {names, vertices, weights_dense}
         skin_json = os.path.join(work, "skin.json")
-        _run([PYBIN, os.path.join(HERE, "blender_read_skin.py"), result_path, skin_json], timeout=600)
+        _run([PYBIN, os.path.join(HERE, "blender_read_skin.py"), result_path, skin_json], timeout=600, expect=skin_json)
         with open(skin_json) as f:
             sk = json.load(f)
         src_verts = np.asarray(sk["vertices"], dtype=np.float32)
