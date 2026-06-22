@@ -132,15 +132,24 @@ def _load_input(ji):
 # Weight transfer helpers
 # --------------------------------------------------------------------------- #
 def _normalize_unit(pts):
-    """Center to bbox center and scale by max extent → robust to any similarity
-    transform UniRig applies internally (center + uniform scale)."""
+    """Center to bbox center and scale EACH AXIS independently into [-0.5, 0.5].
+
+    Per-axis (not uniform) is deliberate: UniRig's skin transform normalizes the
+    mesh into a [-1,1] cube per-axis (configs/transform/...: normalize_into
+    [-1,1]), so its exported result is non-uniformly squashed relative to our
+    natural-proportioned mesh. A uniform (max-extent) normalize leaves the two in
+    different shapes, so the nearest-neighbour transfer mismatches — worst at the
+    extremities (we saw limbs land far from their bones). Normalizing both meshes
+    per-axis maps them to the same box, which is an identical affine on each, so
+    NN correspondences (and thus the weights) line up. Weights are unaffected by
+    the spatial scaling; we only use this for matching, then apply the result to
+    the ORIGINAL vertices."""
     lo = pts.min(axis=0)
     hi = pts.max(axis=0)
     center = (lo + hi) * 0.5
-    scale = float((hi - lo).max())
-    if scale <= 1e-9:
-        scale = 1.0
-    return (pts - center) / scale
+    ext = hi - lo
+    ext[ext < 1e-9] = 1.0
+    return (pts - center) / ext
 
 
 def _best_orientation(sv, dv, num=16384):
@@ -203,6 +212,11 @@ def _transfer_weights(src_verts, src_weights, dst_verts, k=6, alpha=8.0):
     sv = _normalize_unit(src_verts.astype(np.float64))
     dv = _normalize_unit(dst_verts.astype(np.float64))
     sv, orient = _best_orientation(sv, dv)
+    # raw per-axis extents (confirms whether UniRig squashes src vs our dst)
+    se = src_verts.max(axis=0) - src_verts.min(axis=0)
+    de = dst_verts.max(axis=0) - dst_verts.min(axis=0)
+    orient["src_extent"] = [round(float(x), 3) for x in se]
+    orient["dst_extent"] = [round(float(x), 3) for x in de]
     k = min(k, len(sv))
     tree = cKDTree(sv)
     dist, idx = tree.query(dv, k=k)
