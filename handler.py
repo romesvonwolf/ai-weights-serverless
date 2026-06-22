@@ -39,6 +39,7 @@ import time
 import gzip
 import base64
 import struct
+import itertools
 import subprocess
 import tempfile
 import traceback
@@ -46,6 +47,7 @@ import urllib.request
 from array import array
 
 import numpy as np
+from scipy.spatial import cKDTree
 import runpod
 
 UNIRIG_DIR = os.environ.get("UNIRIG_DIR", "/opt/UniRig")
@@ -141,15 +143,55 @@ def _normalize_unit(pts):
     return (pts - center) / scale
 
 
+def _best_orientation(sv, dv, num=16384):
+    """Find the axis permutation + sign flip that best aligns source verts `sv`
+    to target verts `dv` (both already normalized to a unit bbox), by minimizing
+    mean nearest-neighbor distance. This is UniRig's own merge-step approach
+    (src/inference/merge.get_correct_orientation_kdtree): the predicted-skin mesh
+    comes back through glTF/FBX in a frame whose handedness/axis order need not
+    match ours, and WITHOUT this the transfer is spatially wrong (we saw the legs
+    land far from their bones). Identity is tried first and ties keep it, so a
+    correct frame is never needlessly flipped to a mirror.
+
+    Returns (oriented_sv, diagnostics).
+    """
+    rng = np.random.default_rng(0)
+    a = sv if len(sv) <= num else sv[rng.permutation(len(sv))[:num]]
+    b = dv if len(dv) <= num else dv[rng.permutation(len(dv))[:num]]
+    perms = list(itertools.permutations((0, 1, 2)))
+    signs_list = [(x, y, z) for x in (1, -1) for y in (1, -1) for z in (1, -1)]
+    best = None
+    ident_loss = None
+    for perm in perms:
+        pa = a[:, perm]
+        for signs in signs_list:
+            t = pa * np.asarray(signs, dtype=pa.dtype)
+            d, _ = cKDTree(t).query(b)
+            loss = float(d.mean())
+            if perm == (0, 1, 2) and signs == (1, 1, 1):
+                ident_loss = loss
+            if best is None or loss < best[0]:
+                best = (loss, perm, signs)
+    _, perm, signs = best
+    oriented = sv[:, perm] * np.asarray(signs, dtype=sv.dtype)
+    return oriented, {
+        "perm": list(perm),
+        "signs": list(signs),
+        "nn_loss": round(best[0], 5),
+        "nn_loss_identity": round(ident_loss, 5) if ident_loss is not None else None,
+    }
+
+
 def _transfer_weights(src_verts, src_weights, dst_verts, k=6, alpha=8.0):
     """KDTree NN transfer (distance-weighted) from src (skinned result) to dst
-    (our full-res mesh), both normalized to a unit bbox first.
+    (our full-res mesh), both normalized to a unit bbox first and orientation-
+    corrected (UniRig comes back in a possibly axis-permuted/mirrored frame).
 
-    src_weights: (Ns, J) dense. Returns (Nd, J) dense.
+    src_weights: (Ns, J) dense. Returns (Nd, J) dense and an orientation diag.
     """
-    from scipy.spatial import cKDTree
     sv = _normalize_unit(src_verts.astype(np.float64))
     dv = _normalize_unit(dst_verts.astype(np.float64))
+    sv, orient = _best_orientation(sv, dv)
     k = min(k, len(sv))
     tree = cKDTree(sv)
     dist, idx = tree.query(dv, k=k)
@@ -160,7 +202,7 @@ def _transfer_weights(src_verts, src_weights, dst_verts, k=6, alpha=8.0):
     w_sum = w.sum(axis=1, keepdims=True)
     w_sum[w_sum < 1e-12] = 1e-12
     out = (src_weights[idx] * w[..., None]).sum(axis=1) / w_sum
-    return out
+    return out, orient
 
 
 def _densify_topk_normalize(dense, names, prune=0.02, top_k=4):
@@ -306,9 +348,10 @@ def compute(data, model, timeout):
 
     # 5. transfer onto our full-res verts
     t_xfer = time.time()
-    dst_dense = _transfer_weights(src_verts, src_dense, verts)
+    dst_dense, orient = _transfer_weights(src_verts, src_dense, verts)
     weights = _densify_topk_normalize(dst_dense, bone_names)
     xfer_s = round(time.time() - t_xfer, 2)
+    print(f"[ai-weights] orientation={orient}", flush=True)
 
     elapsed = round(time.time() - t0, 2)
     bones_with = sum(1 for nm in bone_names if len(weights[nm]) > 0)
@@ -323,6 +366,7 @@ def compute(data, model, timeout):
             "matched_groups": matched,
             "bones_with_weights": bones_with,
             "model": model,
+            "orientation": orient,
             "timing": {
                 "build_glb_s": build_s,
                 "inference_s": infer_s,
