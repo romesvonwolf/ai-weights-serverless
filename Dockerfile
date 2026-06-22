@@ -48,13 +48,18 @@ RUN pip install --upgrade pip setuptools wheel \
     && pip install --no-cache-dir numpy==1.26.4
 
 # GPU extension wheels (prebuilt; nothing compiles). pyg + flash-attn matched to
-# torch 2.7 / cu128 so they carry Blackwell kernels. NOTE: spconv is NOT a UniRig
-# dependency (not in its requirements.txt) and has no cu128 build, so it's
-# deliberately omitted.
+# torch 2.7 / cu128.
 RUN pip install --no-cache-dir torch_scatter torch_cluster \
     -f https://data.pyg.org/whl/torch-2.7.0+cu128.html
 RUN pip install --no-cache-dir \
     "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.7cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+# spconv IS a required UniRig dependency — its run.py (skin + skeleton inference)
+# imports it at module load, so without it inference crashes and produces no
+# output. PyPI's highest CUDA build is spconv-cu120; it bundles its own CUDA 12.0
+# runtime and ships kernels for sm_86/sm_89, i.e. our A5000 / L4 / RTX 3090 pool,
+# so it runs fine next to the cu128 torch wheel. (spconv-cu120 has NO sm_120
+# kernels — an additional reason this endpoint is pinned to Ampere/Ada GPUs.)
+RUN pip install --no-cache-dir spconv-cu120
 
 # Blender as a python module (UniRig's extractor + our bpy helpers import bpy).
 RUN pip install --no-cache-dir bpy==4.2.0

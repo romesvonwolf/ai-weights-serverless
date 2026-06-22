@@ -215,26 +215,38 @@ def _run(cmd, cwd=None, timeout=1800, env=None, expect=None):
 
 def _run_unirig(in_glb, work, timeout):
     out_fbx = os.path.join(work, "skin.fbx")
-    _run(
+    # generate_skin.sh chains extract.sh + run.py via `eval` and then always
+    # `echo done` (exit 0) regardless of run.py's result, so a crash inside
+    # run.py shows up only as a MISSING output file. Capture the subprocess
+    # logs and surface their tail so the real error reaches the job result.
+    proc = _run(
         ["bash", "launch/inference/generate_skin.sh",
          "--input", in_glb, "--output", out_fbx,
          "--faces_target_count", str(FACES_TARGET)],
         cwd=UNIRIG_DIR, timeout=timeout, expect=out_fbx,
     )
     if not os.path.exists(out_fbx):
-        raise RuntimeError("UniRig produced no skin.fbx")
+        raise RuntimeError(
+            f"UniRig produced no skin.fbx (generate_skin.sh exit {proc.returncode}).\n"
+            f"--- stdout tail ---\n{(proc.stdout or '')[-3000:]}\n"
+            f"--- stderr tail ---\n{(proc.stderr or '')[-3000:]}"
+        )
     return out_fbx, "AI_UNIRIG"
 
 
 def _run_skintokens(in_glb, work, timeout):
     out_glb = os.path.join(work, "skin.glb")
-    _run(
+    proc = _run(
         [PYBIN, "demo.py", "--input", in_glb, "--output", out_glb,
          "--use_skeleton", "--use_transfer"],
         cwd=SKINTOKENS_DIR, timeout=timeout, expect=out_glb,
     )
     if not os.path.exists(out_glb):
-        raise RuntimeError("SkinTokens produced no skin.glb")
+        raise RuntimeError(
+            f"SkinTokens produced no skin.glb (demo.py exit {proc.returncode}).\n"
+            f"--- stdout tail ---\n{(proc.stdout or '')[-3000:]}\n"
+            f"--- stderr tail ---\n{(proc.stderr or '')[-3000:]}"
+        )
     return out_glb, "AI_SKINTOKENS"
 
 
