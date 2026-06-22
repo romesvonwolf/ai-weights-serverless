@@ -106,6 +106,12 @@ RUN if [ -f ${SKINTOKENS_DIR}/requirements.txt ]; then \
       && pip install --no-cache-dir -r /tmp/st_extra.txt || echo "WARN: SkinTokens deps failed; unirig still available"; \
     fi
 
+# torch.load weights_only shim. UniRig/SkinTokens checkpoints embed python-box
+# objects; torch>=2.6 defaults torch.load(weights_only=True) and rejects them.
+# Dropping this `sitecustomize.py` into site-packages makes Python auto-import it
+# on every `python run.py`, forcing weights_only=False (pre-2.6 behaviour).
+COPY sitecustomize.py /usr/local/lib/python3.11/dist-packages/sitecustomize.py
+
 # --- worker ---
 WORKDIR /app
 COPY handler.py /app/handler.py
