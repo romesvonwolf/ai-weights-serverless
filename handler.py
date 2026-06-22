@@ -131,19 +131,30 @@ def _load_input(ji):
 # --------------------------------------------------------------------------- #
 # Weight transfer helpers
 # --------------------------------------------------------------------------- #
-def _normalize_unit(pts):
-    """Center to bbox center and scale EACH AXIS independently into [-0.5, 0.5].
+def _normalize_uniform(pts):
+    """Center to bbox center and scale by the MAX half-extent (uniform), so the
+    cloud fits in [-1,1] with proportions PRESERVED. This is exactly UniRig's
+    own normalization (merge.denormalize_vertices: scale = max(extent)/2). We use
+    it for the discrete orientation search, where preserving proportions is what
+    makes the correct axis frame win unambiguously."""
+    lo = pts.min(axis=0)
+    hi = pts.max(axis=0)
+    center = (lo + hi) * 0.5
+    scale = float((hi - lo).max()) * 0.5
+    if scale < 1e-9:
+        scale = 1.0
+    return (pts - center) / scale
 
-    Per-axis (not uniform) is deliberate: UniRig's skin transform normalizes the
-    mesh into a [-1,1] cube per-axis (configs/transform/...: normalize_into
-    [-1,1]), so its exported result is non-uniformly squashed relative to our
-    natural-proportioned mesh. A uniform (max-extent) normalize leaves the two in
-    different shapes, so the nearest-neighbour transfer mismatches — worst at the
-    extremities (we saw limbs land far from their bones). Normalizing both meshes
-    per-axis maps them to the same box, which is an identical affine on each, so
-    NN correspondences (and thus the weights) line up. Weights are unaffected by
-    the spatial scaling; we only use this for matching, then apply the result to
-    the ORIGINAL vertices."""
+
+def _normalize_peraxis(pts):
+    """Center and scale EACH AXIS independently into [-0.5, 0.5]. Used ONLY for
+    the dense nearest-neighbour match (after orientation is fixed): UniRig skins
+    a resampled proxy whose proportions differ from our exact mesh (we measured
+    proxy depth/height 0.71 vs our 0.21 — the proxy is much rounder). A uniform
+    match then pulls torso verts onto limb proxy verts at the extremities. Mapping
+    both meshes to the SAME unit box makes a vertex at relative position (rx,ry,rz)
+    correspond to the proxy vertex at the same relative position, so limbs/feet/
+    hands line up by anatomy regardless of the proxy being fatter or thinner."""
     lo = pts.min(axis=0)
     hi = pts.max(axis=0)
     center = (lo + hi) * 0.5
@@ -152,21 +163,22 @@ def _normalize_unit(pts):
     return (pts - center) / ext
 
 
-def _best_orientation(sv, dv, num=16384):
-    """Find the axis permutation + sign flip that best aligns source verts `sv`
-    to target verts `dv` (both already normalized to a unit bbox), by minimizing
-    mean nearest-neighbor distance. This is UniRig's own merge-step approach
-    (src/inference/merge.get_correct_orientation_kdtree): the predicted-skin mesh
-    comes back through glTF/FBX in a frame whose handedness/axis order need not
-    match ours, and WITHOUT this the transfer is spatially wrong (we saw the legs
-    land far from their bones). Identity is tried first and ties keep it, so a
-    correct frame is never needlessly flipped to a mirror.
+def _best_orientation(src_verts, dst_verts, num=16384):
+    """Find the axis permutation + sign flip that best aligns src to dst by
+    minimizing mean nearest-neighbor distance, in UNIFORM-normalized (proportion-
+    preserving) space. This mirrors UniRig's merge.get_correct_orientation_kdtree.
+    Doing it in uniform (not per-axis) space is essential: in a per-axis unit cube
+    every axis is the same length, so permutations match spuriously and a wrong
+    frame can win; with proportions preserved, the true frame is unambiguous.
 
-    Returns (oriented_sv, diagnostics).
+    Returns (perm, signs, diagnostics). The caller applies perm/signs to the RAW
+    src verts before the per-axis NN match.
     """
+    su = _normalize_uniform(src_verts.astype(np.float64))
+    du = _normalize_uniform(dst_verts.astype(np.float64))
     rng = np.random.default_rng(0)
-    a = sv if len(sv) <= num else sv[rng.permutation(len(sv))[:num]]
-    b = dv if len(dv) <= num else dv[rng.permutation(len(dv))[:num]]
+    a = su if len(su) <= num else su[rng.permutation(len(su))[:num]]
+    b = du if len(du) <= num else du[rng.permutation(len(du))[:num]]
     perms = list(itertools.permutations((0, 1, 2)))
     signs_list = [(x, y, z) for x in (1, -1) for y in (1, -1) for z in (1, -1)]
     best = None
@@ -192,8 +204,7 @@ def _best_orientation(sv, dv, num=16384):
         chosen_loss = ident_loss
     else:
         chosen_loss = best[0]
-    oriented = sv[:, perm] * np.asarray(signs, dtype=sv.dtype)
-    return oriented, {
+    return perm, signs, {
         "perm": list(perm),
         "signs": list(signs),
         "nn_loss": round(chosen_loss, 5),
@@ -203,20 +214,24 @@ def _best_orientation(sv, dv, num=16384):
 
 
 def _transfer_weights(src_verts, src_weights, dst_verts, k=6, alpha=8.0):
-    """KDTree NN transfer (distance-weighted) from src (skinned result) to dst
-    (our full-res mesh), both normalized to a unit bbox first and orientation-
-    corrected (UniRig comes back in a possibly axis-permuted/mirrored frame).
+    """Transfer weights from src (UniRig's skinned proxy) to dst (our full-res
+    mesh). Two-stage to match UniRig's intent while handling the proxy/target
+    proportion mismatch: (1) pick the axis frame in UNIFORM space where it's
+    unambiguous, (2) do the distance-weighted NN match in PER-AXIS space so the
+    fatter proxy and our thin mesh occupy the same unit box and anatomy lines up.
 
     src_weights: (Ns, J) dense. Returns (Nd, J) dense and an orientation diag.
     """
-    sv = _normalize_unit(src_verts.astype(np.float64))
-    dv = _normalize_unit(dst_verts.astype(np.float64))
-    sv, orient = _best_orientation(sv, dv)
-    # raw per-axis extents (confirms whether UniRig squashes src vs our dst)
+    perm, signs, orient = _best_orientation(src_verts, dst_verts)
+    # raw per-axis extents (confirms the proxy vs our-mesh proportion mismatch)
     se = src_verts.max(axis=0) - src_verts.min(axis=0)
     de = dst_verts.max(axis=0) - dst_verts.min(axis=0)
     orient["src_extent"] = [round(float(x), 3) for x in se]
     orient["dst_extent"] = [round(float(x), 3) for x in de]
+    # apply the chosen frame to raw src, then per-axis normalize both for the NN
+    src_oriented = src_verts.astype(np.float64)[:, perm] * np.asarray(signs, dtype=np.float64)
+    sv = _normalize_peraxis(src_oriented)
+    dv = _normalize_peraxis(dst_verts.astype(np.float64))
     k = min(k, len(sv))
     tree = cKDTree(sv)
     dist, idx = tree.query(dv, k=k)
@@ -419,6 +434,14 @@ def compute(data, model, timeout):
     xfer_s = round(time.time() - t_xfer, 2)
     print(f"[ai-weights] orientation={orient}", flush=True)
 
+    # definitive metric: post-transfer quality on OUR mesh, scored against OUR
+    # input skeleton (same frame, no round-trip) — directly comparable to
+    # src_quality so we can see how much the transfer degrades the prediction.
+    our_joints = {b["name"]: {"head": b["head"], "tail": b["tail"]}
+                  for b in bones if b.get("head") and b.get("tail")}
+    dst_quality = _dominant_quality(verts, dst_dense, bone_names, our_joints)
+    print(f"[ai-weights] dst_quality={dst_quality}", flush=True)
+
     elapsed = round(time.time() - t0, 2)
     bones_with = sum(1 for nm in bone_names if len(weights[nm]) > 0)
     return {
@@ -434,6 +457,7 @@ def compute(data, model, timeout):
             "model": model,
             "orientation": orient,
             "src_quality": src_quality,
+            "dst_quality": dst_quality,
             "timing": {
                 "build_glb_s": build_s,
                 "inference_s": infer_s,
