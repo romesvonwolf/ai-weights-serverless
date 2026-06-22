@@ -42,17 +42,23 @@ RUN pip install --upgrade pip setuptools wheel \
 RUN pip install spconv-cu120
 RUN pip install torch_scatter torch_cluster \
     -f https://data.pyg.org/whl/torch-2.3.1+cu121.html --no-cache-dir
-# flash-attn: prebuilt wheel for torch2.3/cu12/py311 (abiFALSE). Falls back to
-# source build if the wheel URL changes.
-RUN pip install flash-attn==2.6.3 --no-build-isolation || \
-    pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+# flash-attn: install the PREBUILT wheel (torch2.3 / cu12 / py311; abiFALSE
+# matches pip-installed torch). NEVER source-build it here — flash-attn from
+# source takes 30-90 min and routinely OOMs CI builders. UniRig's
+# requirements.txt also lists flash_attn (unpinned); installing it here first
+# means that step finds it already satisfied and won't trigger a source build.
+RUN pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 
 # --- Blender as a python module (extractor + our bpy helpers import bpy) ---
 RUN pip install bpy==4.2.0
 
 # --- UniRig (default model) ---
 RUN git clone --depth 1 https://github.com/VAST-AI-Research/UniRig.git ${UNIRIG_DIR}
-RUN cd ${UNIRIG_DIR} && pip install -r requirements.txt psutil runpod trimesh scipy
+# requirements.txt pulls flash_attn (already satisfied by the wheel above) +
+# bpy==4.2 + transformers/lightning/open3d/pyrender/etc. Re-pin numpy AFTER, as
+# some of those deps will otherwise upgrade numpy past 1.26.x and break UniRig.
+RUN cd ${UNIRIG_DIR} && pip install -r requirements.txt psutil runpod scipy \
+    && pip install numpy==1.26.4
 
 # Pre-download the skinning checkpoint so cold starts don't pay the HF download.
 RUN cd ${UNIRIG_DIR} && python -c "from src.inference.download import download; download('experiments/skin/articulation-xl/model.ckpt')" || \
