@@ -25,7 +25,8 @@ FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
-ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0+PTX"
+# include 12.0 (Blackwell / RTX PRO 6000) — RunPod serverless serves sm_120 GPUs.
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;12.0+PTX"
 ENV UNIRIG_DIR=/opt/UniRig
 ENV SKINTOKENS_DIR=/opt/SkinTokens
 ENV HF_HOME=/opt/hf-cache
@@ -36,21 +37,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 libglib2.0-0 libxrender1 libxi6 libxkbcommon0 libsm6 libxext6 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# torch 2.4.0 (cu121) — reinstall from the pip index so the ABI is the standard
-# manylinux cxx11abiFALSE that our flash-attn / pyg / spconv wheels are built
-# against, and the CUDA minor (12.1) matches them exactly. numpy MUST stay
-# 1.26.x for UniRig.
+# torch 2.7.0 (cu128). RunPod serverless serves Blackwell GPUs (RTX PRO 6000,
+# sm_120); torch <=2.4/cu12.1 has no sm_120 kernels, so the worker's CUDA
+# fitness check fails and it exits unhealthy (jobs never dispatch). cu128 torch
+# 2.7 ships Blackwell kernels — the same choice our working hy-motion worker
+# made. torch's pip wheel bundles its own CUDA 12.8 libs, so the cu12.4 base is
+# irrelevant. numpy MUST stay 1.26.x for UniRig.
 RUN pip install --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121 \
+    && pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128 \
     && pip install --no-cache-dir numpy==1.26.4
 
-# GPU extension wheels, each in its own small layer (all prebuilt — nothing
-# compiles here; flash-attn from source would take 30-90 min and OOM).
-RUN pip install --no-cache-dir spconv-cu120
+# GPU extension wheels (prebuilt; nothing compiles). pyg + flash-attn matched to
+# torch 2.7 / cu128 so they carry Blackwell kernels. NOTE: spconv is NOT a UniRig
+# dependency (not in its requirements.txt) and has no cu128 build, so it's
+# deliberately omitted.
 RUN pip install --no-cache-dir torch_scatter torch_cluster \
-    -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
+    -f https://data.pyg.org/whl/torch-2.7.0+cu128.html
 RUN pip install --no-cache-dir \
-    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.7cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 
 # Blender as a python module (UniRig's extractor + our bpy helpers import bpy).
 RUN pip install --no-cache-dir bpy==4.2.0
