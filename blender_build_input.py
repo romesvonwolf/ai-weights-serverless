@@ -73,6 +73,15 @@ def build(mesh_json, out_glb):
         if b["name"] not in mesh_obj.vertex_groups:
             mesh_obj.vertex_groups.new(name=b["name"])
 
+    # Bind EVERY vertex to the root bone with weight 1.0. This placeholder skin is
+    # essential, not cosmetic: Blender's glTF exporter omits a skin whose weights
+    # are all zero, so an unweighted armature round-trips as plain empties and
+    # UniRig's extractor finds no ARMATURE object (asset.joints stays None →
+    # crash in get_vertex_group). UniRig predicts its OWN weights and ignores
+    # these, so any valid non-empty binding works; root=1.0 is the simplest.
+    root_name = next((b["name"] for b in bones if not b.get("parent")), bones[0]["name"])
+    mesh_obj.vertex_groups[root_name].add(list(range(len(verts))), 1.0, "REPLACE")
+
     bpy.ops.object.select_all(action="DESELECT")
     bpy.ops.export_scene.gltf(
         filepath=out_glb,
