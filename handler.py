@@ -1,0 +1,365 @@
+"""
+RunPod Serverless Handler — AI weight painting (UniRig / SkinTokens).
+
+A SEPARATE GPU worker from the Blender bone-heat one (runpod/blender-weights).
+It runs a learned skinning model that predicts per-vertex skin weights for our
+EXISTING skeleton, then maps them back onto our exact full-res mesh.
+
+I/O contract is identical to the blender-weights worker so the Next.js routes
+and B2 transport are reused verbatim:
+  INPUT  : `input_url` → gzipped 'SMW1' binary {vertices,triangles,bones}.
+  OUTPUT : gzip the weights JSON and PUT it to the presigned `output_put_url`.
+  We return only a small summary.
+
+Job input:
+  {
+    "input_url": "https://.../input.smw.gz",
+    "output_put_url": "https://...?X-Amz-...",
+    "output_content_type": "application/octet-stream",
+    "timeout": 1800,
+    "model": "unirig" | "skintokens"     # default "unirig"
+  }
+
+Pipeline (per job):
+  1. decode SMW1 → {vertices (N,3), triangles (F,3), bones[{name,head,tail,parent}]}
+  2. Blender (bpy, subprocess) builds a GLB = mesh + armature with OUR bone names.
+  3. run the model's official skinning inference (existing-skeleton mode):
+       unirig     → bash launch/inference/generate_skin.sh --input in.glb --output skin.fbx
+       skintokens → python demo.py --input in.glb --output skin.glb --use_skeleton --use_transfer
+  4. Blender reads the skinned result → per-vertex vertex-group weights + verts.
+  5. NN-transfer (normalized space) those weights onto our ORIGINAL full-res
+     vertices, prune + top-4 + renormalize.
+  6. emit { weights, weight_method, diagnostics, elapsed } → B2.
+"""
+
+import os
+import sys
+import json
+import time
+import gzip
+import base64
+import struct
+import subprocess
+import tempfile
+import traceback
+import urllib.request
+from array import array
+
+import numpy as np
+import runpod
+
+UNIRIG_DIR = os.environ.get("UNIRIG_DIR", "/opt/UniRig")
+SKINTOKENS_DIR = os.environ.get("SKINTOKENS_DIR", "/opt/SkinTokens")
+PYBIN = os.environ.get("PYBIN", sys.executable)
+DEFAULT_TIMEOUT = int(os.environ.get("AIWEIGHT_TIMEOUT", "1800"))
+FACES_TARGET = int(os.environ.get("AIWEIGHT_FACES_TARGET", "50000"))
+MAX_INLINE_OUTPUT = int(os.environ.get("MAX_INLINE_OUTPUT", str(6 * 1024 * 1024)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+# --------------------------------------------------------------------------- #
+# B2 transport (identical contract to runpod/blender-weights/handler.py)
+# --------------------------------------------------------------------------- #
+def _download(url, timeout=300):
+    req = urllib.request.Request(url, headers={"User-Agent": "ai-weights-worker"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _maybe_gunzip(raw):
+    if len(raw) >= 2 and raw[0] == 0x1F and raw[1] == 0x8B:
+        return gzip.decompress(raw)
+    return raw
+
+
+def _decode_smw1(buf):
+    if len(buf) < 16 or buf[0:4] != b"SMW1":
+        raise ValueError("not an SMW1 blob")
+    Vn, Tn, Bn = struct.unpack_from("<III", buf, 4)
+    off = 16
+    vbytes = Vn * 3 * 4
+    verts_arr = array("f")
+    verts_arr.frombytes(bytes(buf[off:off + vbytes]))
+    off += vbytes
+    if sys.byteorder != "little":
+        verts_arr.byteswap()
+    tbytes = Tn * 3 * 4
+    tris_arr = array("i")
+    tris_arr.frombytes(bytes(buf[off:off + tbytes]))
+    off += tbytes
+    if sys.byteorder != "little":
+        tris_arr.byteswap()
+    bones = json.loads(bytes(buf[off:off + Bn]).decode("utf-8"))
+    vertices = np.array(verts_arr, dtype=np.float32).reshape(-1, 3)
+    triangles = np.array(tris_arr, dtype=np.int64).reshape(-1, 3)
+    return {"vertices": vertices, "triangles": triangles, "bones": bones}
+
+
+def _parse_mesh_bytes(raw):
+    if len(raw) >= 4 and raw[0:4] == b"SMW1":
+        return _decode_smw1(raw)
+    d = json.loads(raw)
+    return {
+        "vertices": np.asarray(d["vertices"], dtype=np.float32).reshape(-1, 3),
+        "triangles": np.asarray(d["triangles"], dtype=np.int64).reshape(-1, 3),
+        "bones": d["bones"],
+    }
+
+
+def _put(url, data, content_type, timeout=300):
+    req = urllib.request.Request(url, data=data, method="PUT")
+    req.add_header("Content-Type", content_type)
+    req.add_header("Content-Length", str(len(data)))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status
+
+
+def _load_input(ji):
+    if ji.get("input_url"):
+        return _parse_mesh_bytes(_maybe_gunzip(_download(ji["input_url"])))
+    if ji.get("mesh_gzip_b64"):
+        return _parse_mesh_bytes(gzip.decompress(base64.b64decode(ji["mesh_gzip_b64"])))
+    return {
+        "vertices": np.asarray(ji["vertices"], dtype=np.float32).reshape(-1, 3),
+        "triangles": np.asarray(ji["triangles"], dtype=np.int64).reshape(-1, 3),
+        "bones": ji["bones"],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Weight transfer helpers
+# --------------------------------------------------------------------------- #
+def _normalize_unit(pts):
+    """Center to bbox center and scale by max extent → robust to any similarity
+    transform UniRig applies internally (center + uniform scale)."""
+    lo = pts.min(axis=0)
+    hi = pts.max(axis=0)
+    center = (lo + hi) * 0.5
+    scale = float((hi - lo).max())
+    if scale <= 1e-9:
+        scale = 1.0
+    return (pts - center) / scale
+
+
+def _transfer_weights(src_verts, src_weights, dst_verts, k=6, alpha=8.0):
+    """KDTree NN transfer (distance-weighted) from src (skinned result) to dst
+    (our full-res mesh), both normalized to a unit bbox first.
+
+    src_weights: (Ns, J) dense. Returns (Nd, J) dense.
+    """
+    from scipy.spatial import cKDTree
+    sv = _normalize_unit(src_verts.astype(np.float64))
+    dv = _normalize_unit(dst_verts.astype(np.float64))
+    k = min(k, len(sv))
+    tree = cKDTree(sv)
+    dist, idx = tree.query(dv, k=k)
+    if k == 1:
+        dist = dist[:, None]
+        idx = idx[:, None]
+    w = np.exp(-alpha * dist)
+    w_sum = w.sum(axis=1, keepdims=True)
+    w_sum[w_sum < 1e-12] = 1e-12
+    out = (src_weights[idx] * w[..., None]).sum(axis=1) / w_sum
+    return out
+
+
+def _densify_topk_normalize(dense, names, prune=0.02, top_k=4):
+    """dense (N, J) → sparse {boneName: {vidx: w}} keeping top-k per vertex."""
+    N, J = dense.shape
+    weights = {nm: {} for nm in names}
+    for v in range(N):
+        row = dense[v]
+        if top_k < J:
+            keep = np.argpartition(row, -top_k)[-top_k:]
+        else:
+            keep = np.arange(J)
+        vals = row[keep]
+        mask = vals > prune
+        keep = keep[mask]
+        vals = vals[mask]
+        s = vals.sum()
+        if s <= 1e-9:
+            j = int(np.argmax(row))
+            weights[names[j]][str(v)] = 1.0
+            continue
+        vals = vals / s
+        for j, wv in zip(keep, vals):
+            weights[names[int(j)]][str(v)] = float(wv)
+    return weights
+
+
+# --------------------------------------------------------------------------- #
+# Model drivers
+# --------------------------------------------------------------------------- #
+def _run(cmd, cwd=None, timeout=1800, env=None):
+    print(f"[ai-weights] $ {' '.join(cmd)} (cwd={cwd})", flush=True)
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+    if proc.stdout:
+        print(proc.stdout[-4000:], flush=True)
+    if proc.returncode != 0:
+        print(proc.stderr[-4000:], flush=True)
+        raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stderr[-1500:]}")
+    return proc
+
+
+def _run_unirig(in_glb, work, timeout):
+    out_fbx = os.path.join(work, "skin.fbx")
+    _run(
+        ["bash", "launch/inference/generate_skin.sh",
+         "--input", in_glb, "--output", out_fbx,
+         "--faces_target_count", str(FACES_TARGET)],
+        cwd=UNIRIG_DIR, timeout=timeout,
+    )
+    if not os.path.exists(out_fbx):
+        raise RuntimeError("UniRig produced no skin.fbx")
+    return out_fbx, "AI_UNIRIG"
+
+
+def _run_skintokens(in_glb, work, timeout):
+    out_glb = os.path.join(work, "skin.glb")
+    _run(
+        [PYBIN, "demo.py", "--input", in_glb, "--output", out_glb,
+         "--use_skeleton", "--use_transfer"],
+        cwd=SKINTOKENS_DIR, timeout=timeout,
+    )
+    if not os.path.exists(out_glb):
+        raise RuntimeError("SkinTokens produced no skin.glb")
+    return out_glb, "AI_SKINTOKENS"
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def compute(data, model, timeout):
+    t0 = time.time()
+    verts = data["vertices"]
+    tris = data["triangles"]
+    bones = data["bones"]
+    N = len(verts)
+    J = len(bones)
+    bone_names = [b["name"] for b in bones]
+    print(f"[ai-weights] model={model} verts={N} tris={len(tris)} bones={J}", flush=True)
+
+    with tempfile.TemporaryDirectory() as work:
+        # 1. mesh + skeleton → JSON for the bpy builder
+        mesh_json = os.path.join(work, "mesh.json")
+        with open(mesh_json, "w") as f:
+            json.dump({
+                "vertices": verts.tolist(),
+                "triangles": tris.tolist(),
+                "bones": bones,
+            }, f)
+
+        # 2. build input GLB (mesh + armature) via Blender (bpy subprocess)
+        in_glb = os.path.join(work, "input.glb")
+        t_build = time.time()
+        _run([PYBIN, os.path.join(HERE, "blender_build_input.py"), mesh_json, in_glb], timeout=600)
+        build_s = round(time.time() - t_build, 2)
+
+        # 3. run the chosen skinning model
+        t_infer = time.time()
+        if model == "skintokens":
+            result_path, method = _run_skintokens(in_glb, work, timeout)
+        else:
+            result_path, method = _run_unirig(in_glb, work, timeout)
+        infer_s = round(time.time() - t_infer, 2)
+
+        # 4. read skinned result → {names, vertices, weights_dense}
+        skin_json = os.path.join(work, "skin.json")
+        _run([PYBIN, os.path.join(HERE, "blender_read_skin.py"), result_path, skin_json], timeout=600)
+        with open(skin_json) as f:
+            sk = json.load(f)
+        src_verts = np.asarray(sk["vertices"], dtype=np.float32)
+        src_names = sk["names"]
+        # dense (Ns, J) aligned to OUR bone order (zero-fill any missing groups)
+        name_to_col = {nm: i for i, nm in enumerate(bone_names)}
+        src_dense = np.zeros((len(src_verts), J), dtype=np.float32)
+        matched = 0
+        for gname, col in sk["groups"].items():
+            if gname in name_to_col:
+                matched += 1
+                arr = np.asarray(col, dtype=np.float32)  # (Ns,)
+                src_dense[:, name_to_col[gname]] = arr
+
+    # 5. transfer onto our full-res verts
+    t_xfer = time.time()
+    dst_dense = _transfer_weights(src_verts, src_dense, verts)
+    weights = _densify_topk_normalize(dst_dense, bone_names)
+    xfer_s = round(time.time() - t_xfer, 2)
+
+    elapsed = round(time.time() - t0, 2)
+    bones_with = sum(1 for nm in bone_names if len(weights[nm]) > 0)
+    return {
+        "weights": weights,
+        "bone_count": J,
+        "weight_method": method,
+        "diagnostics": {
+            "input_verts": N,
+            "input_tris": int(len(tris)),
+            "result_verts": int(len(src_verts)),
+            "matched_groups": matched,
+            "bones_with_weights": bones_with,
+            "model": model,
+            "timing": {
+                "build_glb_s": build_s,
+                "inference_s": infer_s,
+                "transfer_s": xfer_s,
+                "total_s": elapsed,
+            },
+        },
+        "elapsed": elapsed,
+    }
+
+
+def handler(job):
+    t0 = time.time()
+    ji = job.get("input", {}) or {}
+    try:
+        data = _load_input(ji)
+    except Exception as e:
+        return {"error": f"input load failed: {e}", "traceback": traceback.format_exc()}
+
+    for k in ("vertices", "triangles", "bones"):
+        if k not in data:
+            return {"error": f"missing '{k}' in mesh input"}
+
+    model = "skintokens" if ji.get("model") == "skintokens" else "unirig"
+    timeout = int(ji.get("timeout", DEFAULT_TIMEOUT))
+
+    try:
+        result_obj = compute(data, model, timeout)
+    except subprocess.TimeoutExpired:
+        return {"error": f"model timed out after {timeout}s"}
+    except Exception as e:
+        return {"error": f"ai-weights failed: {e}", "traceback": traceback.format_exc()}
+
+    out_bytes = json.dumps(result_obj).encode("utf-8")
+
+    out_put_url = ji.get("output_put_url")
+    if out_put_url:
+        ct = ji.get("output_content_type", "application/octet-stream")
+        gz = gzip.compress(out_bytes, 6)
+        try:
+            _put(out_put_url, gz, ct)
+        except Exception as e:
+            return {"error": f"output upload failed: {e}", "traceback": traceback.format_exc()}
+        return {
+            "ok": True,
+            "output_uploaded": True,
+            "output_bytes": len(gz),
+            "output_gzip": True,
+            "weight_method": result_obj.get("weight_method"),
+            "bone_count": result_obj.get("bone_count"),
+            "diagnostics": result_obj.get("diagnostics"),
+            "elapsed": result_obj.get("elapsed"),
+            "handler_elapsed": round(time.time() - t0, 2),
+        }
+
+    if len(out_bytes) > MAX_INLINE_OUTPUT:
+        return {"error": f"weights too large to return inline ({len(out_bytes)} bytes); provide output_put_url"}
+    result_obj["handler_elapsed"] = round(time.time() - t0, 2)
+    return result_obj
+
+
+print("[ai-weights] worker starting...", flush=True)
+runpod.serverless.start({"handler": handler})
