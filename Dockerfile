@@ -4,18 +4,23 @@
 # handler NN-transfers them onto our full-res mesh. Separate from the CPU
 # Blender bone-heat worker (runpod/blender-weights).
 #
-# GPU: needs a CUDA GPU with >= 16 GB VRAM (UniRig generation needs ~8 GB; give
-# headroom for SkinTokens). L4 / A5000 / 4090 / L40S class all work.
+# GPU: needs a CUDA GPU with >= 16 GB VRAM. L4 / A5000 / 4090 / L40S all work.
 #
-# Build is GitHub-repo-backed on RunPod (tag = git short sha), same as the
-# blender-weights worker.
-
-# RUNTIME (not devel) base: ~4.5 GB smaller. Nothing here compiles CUDA at build
-# time — torch, spconv, torch_scatter/cluster and flash-attn all install from
-# prebuilt wheels — so we don't need nvcc/the devel toolkit. Keeping the image
-# small matters: the GitHub builder failed on the devel image (out of build disk
-# while writing the OCI output tar of a 20 GB+ image).
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+# Build is GitHub-repo-backed on RunPod (tag = git short sha).
+#
+# BASE: runpod/pytorch (same tag our proven hy-motion worker builds on). Using
+# RunPod's own image means python3.11 + CUDA + git + system libs are already set
+# up and the layer is cached on RunPod's builder — no apt/deadsnakes risk.
+#
+# WHY THE INSTALLS ARE SPLIT INTO SMALL PINNED GROUPS (this is the important
+# part): an earlier nvidia/cuda build failed on a single giant
+# `pip install -r requirements.txt`. That UniRig requirements file pulls open3d,
+# whose dependency tree is enormous (dash/plotly/jupyter/scikit-learn/
+# matplotlib/...). Resolving it all at once is memory-heavy and the RunPod
+# builder OOM-killed pip (it resolves fine on a high-RAM box). hy-motion avoids
+# this by pre-installing pinned deps in small steps and running the repo
+# requirements filtered + non-fatal. We do the same.
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -25,56 +30,66 @@ ENV UNIRIG_DIR=/opt/UniRig
 ENV SKINTOKENS_DIR=/opt/SkinTokens
 ENV HF_HOME=/opt/hf-cache
 
-# --- system + python 3.11 ---
+# System libs that open3d / bpy / pyrender load at runtime (headless GL etc.).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    software-properties-common git curl wget build-essential ninja-build \
-    libgl1 libglib2.0-0 libxrender1 libxi6 libxkbcommon0 libsm6 libxext6 \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-dev python3.11-venv \
+    git curl \
+    libgl1 libglib2.0-0 libxrender1 libxi6 libxkbcommon0 libsm6 libxext6 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
-    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
-
-# --- torch (cu121) + numpy pin (UniRig requires numpy 1.26.4) ---
+# torch 2.4.0 (cu121) — reinstall from the pip index so the ABI is the standard
+# manylinux cxx11abiFALSE that our flash-attn / pyg / spconv wheels are built
+# against, and the CUDA minor (12.1) matches them exactly. numpy MUST stay
+# 1.26.x for UniRig.
 RUN pip install --upgrade pip setuptools wheel \
-    && pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121 \
-    && pip install numpy==1.26.4
+    && pip install --no-cache-dir torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121 \
+    && pip install --no-cache-dir numpy==1.26.4
 
-# --- sparse-conv + scatter/cluster + flash-attn (UniRig install guide) ---
-RUN pip install spconv-cu120
-RUN pip install torch_scatter torch_cluster \
-    -f https://data.pyg.org/whl/torch-2.3.1+cu121.html --no-cache-dir
-# flash-attn: install the PREBUILT wheel (torch2.3 / cu12 / py311; abiFALSE
-# matches pip-installed torch). NEVER source-build it here — flash-attn from
-# source takes 30-90 min and routinely OOMs CI builders. UniRig's
-# requirements.txt also lists flash_attn (unpinned); installing it here first
-# means that step finds it already satisfied and won't trigger a source build.
-RUN pip install "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.3cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+# GPU extension wheels, each in its own small layer (all prebuilt — nothing
+# compiles here; flash-attn from source would take 30-90 min and OOM).
+RUN pip install --no-cache-dir spconv-cu120
+RUN pip install --no-cache-dir torch_scatter torch_cluster \
+    -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
+RUN pip install --no-cache-dir \
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 
-# --- Blender as a python module (extractor + our bpy helpers import bpy) ---
-RUN pip install bpy==4.2.0
+# Blender as a python module (UniRig's extractor + our bpy helpers import bpy).
+RUN pip install --no-cache-dir bpy==4.2.0
+
+# --- UniRig's runtime deps, pre-installed as small pinned GROUPS (low peak
+# memory; each group is a tiny resolve). Versions mirror UniRig requirements.txt.
+RUN pip install --no-cache-dir transformers==4.51.3 huggingface_hub safetensors accelerate
+RUN pip install --no-cache-dir pytorch_lightning lightning timm einops omegaconf python-box addict
+RUN pip install --no-cache-dir trimesh fast-simplification psutil runpod scipy
+# open3d in isolation — it's the heavy tree that overflowed the all-at-once build.
+RUN pip install --no-cache-dir open3d
+# Peripheral (rendering / logging) — not needed for skinning inference, so don't
+# let them fail the build.
+RUN pip install --no-cache-dir pyrender wandb || echo "WARN: pyrender/wandb optional deps failed"
 
 # --- UniRig (default model) ---
 RUN git clone --depth 1 https://github.com/VAST-AI-Research/UniRig.git ${UNIRIG_DIR}
-# requirements.txt pulls flash_attn (already satisfied by the wheel above) +
-# bpy==4.2 + transformers/lightning/open3d/pyrender/etc. Re-pin numpy AFTER, as
-# some of those deps will otherwise upgrade numpy past 1.26.x and break UniRig.
-RUN cd ${UNIRIG_DIR} && pip install -r requirements.txt psutil runpod scipy \
-    && pip install numpy==1.26.4
+# Catch-all for anything in UniRig's requirements we didn't pin above. Filter
+# out everything we already control (torch/vision/numpy/flash-attn/bpy/open3d)
+# so the resolver can't churn them, and keep it NON-FATAL — the runtime deps are
+# already installed above; this only backfills extras. Re-pin numpy after.
+RUN cd ${UNIRIG_DIR} \
+    && grep -ivE '^(torch|torchvision|numpy|flash[-_]attn|bpy|open3d)' requirements.txt > /tmp/unirig_extra.txt || true \
+    && echo "=== UniRig backfill reqs ===" && cat /tmp/unirig_extra.txt \
+    && pip install --no-cache-dir -r /tmp/unirig_extra.txt || echo "WARN: some UniRig backfill deps failed (core deps already installed)" \
+    && pip install --no-cache-dir numpy==1.26.4 \
+    && rm -f /tmp/unirig_extra.txt
 
-# NOTE: the skinning checkpoint is intentionally NOT baked into the image — it
-# adds ~2 GB to the image + build disk (which is what was overflowing the
-# builder) and needs HF access at build time. UniRig's run.py downloads it
-# automatically on the first request into HF_HOME (the worker's container disk).
+# NOTE: the skinning checkpoint is intentionally NOT baked in — UniRig's run.py
+# downloads it on first request into HF_HOME (the worker's container disk).
 
 # --- SkinTokens (experimental, --model skintokens) ---
 RUN git clone --depth 1 https://github.com/VAST-AI-Research/SkinTokens.git ${SKINTOKENS_DIR} || \
     echo "WARN: SkinTokens clone failed; unirig still available"
-RUN cd ${SKINTOKENS_DIR} && pip install -r requirements.txt || \
-    echo "WARN: SkinTokens deps failed; unirig still available"
+RUN if [ -f ${SKINTOKENS_DIR}/requirements.txt ]; then \
+      cd ${SKINTOKENS_DIR} \
+      && grep -ivE '^(torch|torchvision|numpy|flash[-_]attn|bpy|open3d)' requirements.txt > /tmp/st_extra.txt || true \
+      && pip install --no-cache-dir -r /tmp/st_extra.txt || echo "WARN: SkinTokens deps failed; unirig still available"; \
+    fi
 
 # --- worker ---
 WORKDIR /app
