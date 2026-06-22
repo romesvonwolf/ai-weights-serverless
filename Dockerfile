@@ -106,10 +106,24 @@ RUN if [ -f ${SKINTOKENS_DIR}/requirements.txt ]; then \
       && pip install --no-cache-dir -r /tmp/st_extra.txt || echo "WARN: SkinTokens deps failed; unirig still available"; \
     fi
 
-# torch.load weights_only shim. UniRig/SkinTokens checkpoints embed python-box
-# objects; torch>=2.6 defaults torch.load(weights_only=True) and rejects them.
-# Dropping this `sitecustomize.py` into site-packages makes Python auto-import it
-# on every `python run.py`, forcing weights_only=False (pre-2.6 behaviour).
+# torch.load weights_only fix (DETERMINISTIC — primary). torch>=2.6 defaults
+# torch.load(weights_only=True) and Lightning forwards it explicitly, so UniRig's
+# checkpoints (which embed a python-box Box) fail to unpickle ("Unsupported
+# global: box.box.Box"). We inject `import torch_compat` as the FIRST line of
+# run.py / demo.py so the override runs in-process, in normal program flow,
+# before the trainer loads the .ckpt. This replaces the earlier sitecustomize.py
+# approach, which this base image's interpreter did NOT auto-import at startup.
+COPY torch_compat.py ${UNIRIG_DIR}/torch_compat.py
+RUN sed -i '1i import torch_compat' ${UNIRIG_DIR}/run.py \
+    && echo "=== run.py head after patch ===" && head -3 ${UNIRIG_DIR}/run.py
+RUN if [ -f ${SKINTOKENS_DIR}/demo.py ]; then \
+      cp ${UNIRIG_DIR}/torch_compat.py ${SKINTOKENS_DIR}/torch_compat.py \
+      && sed -i '1i import torch_compat' ${SKINTOKENS_DIR}/demo.py \
+      && echo "patched SkinTokens demo.py"; \
+    fi
+
+# Harmless backstop only (kept in case any other code path calls torch.load
+# without going through run.py); the entrypoint injection above is the real fix.
 COPY sitecustomize.py /usr/local/lib/python3.11/dist-packages/sitecustomize.py
 
 # --- worker ---
