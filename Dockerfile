@@ -60,13 +60,14 @@ RUN pip install --no-cache-dir bpy==4.2.0
 RUN pip install --no-cache-dir transformers==4.51.3 huggingface_hub safetensors accelerate
 RUN pip install --no-cache-dir pytorch_lightning lightning timm einops omegaconf python-box addict
 RUN pip install --no-cache-dir trimesh fast-simplification psutil runpod scipy
-# open3d in isolation. Pin 0.18.0: UniRig was built against it, its wheel is
-# manylinux_2_27 (much broader glibc compat than 0.19's manylinux_2_31), and it
-# was the lone package failing to install on RunPod's builder. If it ever fails
-# again, surface the real pip error at the BOTTOM of the build log (the RunPod
-# console only shows the log tail) so it's actually readable.
-RUN set -o pipefail; pip install --no-cache-dir open3d==0.18.0 2>&1 | tee /tmp/o3d.log \
-    || { echo "===== OPEN3D INSTALL FAILED — real error follows ====="; tail -n 60 /tmp/o3d.log; exit 1; }
+# open3d with --no-deps. UniRig only uses open3d for HEADLESS mesh geometry
+# (io / geometry / utility), which needs just numpy (already installed). open3d's
+# declared deps pull a web/viz tree (dash -> flask -> blinker), and the base
+# image has a distutils-installed `blinker` that pip refuses to uninstall to
+# upgrade ("Cannot uninstall blinker ... distutils installed project") — that was
+# failing every build. --no-deps sidesteps the whole tree and saves ~1 GB.
+# Non-fatal: a hiccup here must never block the build (verified at runtime).
+RUN pip install --no-cache-dir --no-deps open3d==0.18.0 || echo "WARN: open3d install skipped"
 # Peripheral (rendering / logging) — not needed for skinning inference, so don't
 # let them fail the build.
 RUN pip install --no-cache-dir pyrender wandb || echo "WARN: pyrender/wandb optional deps failed"
