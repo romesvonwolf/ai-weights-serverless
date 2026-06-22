@@ -10,7 +10,12 @@
 # Build is GitHub-repo-backed on RunPod (tag = git short sha), same as the
 # blender-weights worker.
 
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+# RUNTIME (not devel) base: ~4.5 GB smaller. Nothing here compiles CUDA at build
+# time — torch, spconv, torch_scatter/cluster and flash-attn all install from
+# prebuilt wheels — so we don't need nvcc/the devel toolkit. Keeping the image
+# small matters: the GitHub builder failed on the devel image (out of build disk
+# while writing the OCI output tar of a 20 GB+ image).
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -60,9 +65,10 @@ RUN git clone --depth 1 https://github.com/VAST-AI-Research/UniRig.git ${UNIRIG_
 RUN cd ${UNIRIG_DIR} && pip install -r requirements.txt psutil runpod scipy \
     && pip install numpy==1.26.4
 
-# Pre-download the skinning checkpoint so cold starts don't pay the HF download.
-RUN cd ${UNIRIG_DIR} && python -c "from src.inference.download import download; download('experiments/skin/articulation-xl/model.ckpt')" || \
-    echo "WARN: UniRig skin ckpt pre-download failed; will download at first run"
+# NOTE: the skinning checkpoint is intentionally NOT baked into the image — it
+# adds ~2 GB to the image + build disk (which is what was overflowing the
+# builder) and needs HF access at build time. UniRig's run.py downloads it
+# automatically on the first request into HF_HOME (the worker's container disk).
 
 # --- SkinTokens (experimental, --model skintokens) ---
 RUN git clone --depth 1 https://github.com/VAST-AI-Research/SkinTokens.git ${SKINTOKENS_DIR} || \
