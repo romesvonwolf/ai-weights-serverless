@@ -32,9 +32,12 @@ ENV SKINTOKENS_DIR=/opt/SkinTokens
 ENV HF_HOME=/opt/hf-cache
 
 # System libs that open3d / bpy / pyrender load at runtime (headless GL etc.).
+# open3d's pybind .so links libGL/libgomp; libegl1+libgles2 let pyrender's EGL
+# path work too (belt-and-braces — we use the open3d voxel backend by default).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl \
     libgl1 libglib2.0-0 libxrender1 libxi6 libxkbcommon0 libsm6 libxext6 libgomp1 \
+    libegl1 libgles2 libx11-6 libusb-1.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # torch 2.7.0 (cu128). RunPod serverless serves Blackwell GPUs (RTX PRO 6000,
@@ -69,14 +72,22 @@ RUN pip install --no-cache-dir bpy==4.2.0
 RUN pip install --no-cache-dir transformers==4.51.3 huggingface_hub safetensors accelerate
 RUN pip install --no-cache-dir pytorch_lightning lightning timm einops omegaconf python-box addict
 RUN pip install --no-cache-dir trimesh fast-simplification psutil runpod scipy
-# open3d with --no-deps. UniRig only uses open3d for HEADLESS mesh geometry
-# (io / geometry / utility), which needs just numpy (already installed). open3d's
-# declared deps pull a web/viz tree (dash -> flask -> blinker), and the base
-# image has a distutils-installed `blinker` that pip refuses to uninstall to
-# upgrade ("Cannot uninstall blinker ... distutils installed project") — that was
-# failing every build. --no-deps sidesteps the whole tree and saves ~1 GB.
-# Non-fatal: a hiccup here must never block the build (verified at runtime).
-RUN pip install --no-cache-dir --no-deps open3d==0.18.0 || echo "WARN: open3d install skipped"
+# open3d is REQUIRED: UniRig's voxel-skin step (vertex_group.py) uses the open3d
+# backend (o3d.geometry.VoxelGrid.create_from_triangle_mesh, CPU) — we select it
+# over pyrender to avoid needing a GPU EGL/GLX context in this headless worker.
+# A prior --no-deps install left open3d UNIMPORTABLE at runtime ("do not have
+# open3d" → voxelization crashes), so install it WITH its deps. The base image's
+# distutils-installed `blinker` can't be uninstalled by pip ("Cannot uninstall
+# blinker ..."), so --ignore-installed blinker lets the resolve proceed; fall
+# back to --no-deps if the full tree fails.
+RUN pip install --no-cache-dir --ignore-installed blinker open3d==0.18.0 \
+    || pip install --no-cache-dir --no-deps open3d==0.18.0 \
+    || echo "WARN: open3d install failed"
+# Re-pin numpy (open3d's dep tree may pull numpy 2.x, which breaks open3d 0.18's
+# import), then fail the BUILD (fast) rather than a 5-min job (slow) if open3d
+# can't import or its core geometry isn't usable.
+RUN pip install --no-cache-dir numpy==1.26.4 \
+    && python -c "import open3d as o3d; print('open3d import OK', o3d.__version__); o3d.geometry.TriangleMesh()"
 # Peripheral (rendering / logging) — not needed for skinning inference, so don't
 # let them fail the build.
 RUN pip install --no-cache-dir pyrender wandb || echo "WARN: pyrender/wandb optional deps failed"
@@ -93,6 +104,14 @@ RUN cd ${UNIRIG_DIR} \
     && pip install --no-cache-dir -r /tmp/unirig_extra.txt || echo "WARN: some UniRig backfill deps failed (core deps already installed)" \
     && pip install --no-cache-dir numpy==1.26.4 \
     && rm -f /tmp/unirig_extra.txt
+
+# Use the open3d (CPU) voxelization backend instead of pyrender. The skin
+# transform's voxel_skin step defaults to backend: pyrender, which needs an EGL
+# GL context (libEGL) the serverless worker can't provide ("Unable to load EGL
+# library"). The open3d branch is pure CPU geometry and UniRig itself documents
+# it as the fallback ("switch to 'open3d' if pyrender does not work").
+RUN sed -i 's/backend: pyrender/backend: open3d/' ${UNIRIG_DIR}/configs/transform/inference_skin_transform.yaml \
+    && echo "=== voxel backend ===" && grep -n 'backend:' ${UNIRIG_DIR}/configs/transform/inference_skin_transform.yaml
 
 # NOTE: the skinning checkpoint is intentionally NOT baked in — UniRig's run.py
 # downloads it on first request into HF_HOME (the worker's container disk).
