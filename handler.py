@@ -173,11 +173,22 @@ def _best_orientation(sv, dv, num=16384):
             if best is None or loss < best[0]:
                 best = (loss, perm, signs)
     _, perm, signs = best
+    # Gate: only adopt a non-identity frame if it's CLEARLY better (>5%). We
+    # control both ends of the glTF/FBX round-trip, so the frame is usually
+    # already identity; a near-tie "win" is almost always a spurious mirror of a
+    # roughly-symmetric body (e.g. a front/back Z-flip) that scrambles limbs.
+    flipped = (perm != (0, 1, 2)) or (tuple(signs) != (1, 1, 1))
+    if flipped and ident_loss is not None and best[0] > ident_loss * 0.95:
+        perm, signs = (0, 1, 2), (1, 1, 1)
+        chosen_loss = ident_loss
+    else:
+        chosen_loss = best[0]
     oriented = sv[:, perm] * np.asarray(signs, dtype=sv.dtype)
     return oriented, {
         "perm": list(perm),
         "signs": list(signs),
-        "nn_loss": round(best[0], 5),
+        "nn_loss": round(chosen_loss, 5),
+        "nn_loss_best": round(best[0], 5),
         "nn_loss_identity": round(ident_loss, 5) if ident_loss is not None else None,
     }
 
@@ -203,6 +214,42 @@ def _transfer_weights(src_verts, src_weights, dst_verts, k=6, alpha=8.0):
     w_sum[w_sum < 1e-12] = 1e-12
     out = (src_weights[idx] * w[..., None]).sum(axis=1) / w_sum
     return out, orient
+
+
+def _dominant_quality(verts, dense, names, joints):
+    """Skinning quality in a mesh's OWN frame: assign each vertex to its
+    dominant (argmax) bone, then measure how far each bone's dominant-vertex
+    centroid sits from that bone's midpoint, normalized by the bbox diagonal.
+    Used on UniRig's RAW output to separate prediction quality from our transfer.
+    """
+    if dense.shape[0] == 0 or not joints:
+        return {}
+    lo = verts.min(axis=0)
+    hi = verts.max(axis=0)
+    diag = float(np.linalg.norm(hi - lo)) or 1.0
+    dom = dense.argmax(axis=1)  # (Ns,)
+    rows = []
+    for j, nm in enumerate(names):
+        if nm not in joints:
+            continue
+        sel = verts[dom == j]
+        if len(sel) == 0:
+            continue
+        cen = sel.mean(axis=0)
+        jm = joints[nm]
+        mid = (np.asarray(jm["head"], dtype=np.float64) + np.asarray(jm["tail"], dtype=np.float64)) * 0.5
+        rel = float(np.linalg.norm(cen - mid) / diag)
+        rows.append((rel, nm, int(len(sel))))
+    if not rows:
+        return {}
+    rows.sort(reverse=True)
+    mean_rel = round(sum(r[0] for r in rows) / len(rows), 4)
+    well = sum(1 for r in rows if r[0] < 0.12)
+    return {
+        "mean_rel": mean_rel,
+        "well_placed": f"{well}/{len(rows)}",
+        "worst": [{"bone": r[1], "rel": round(r[0], 3), "n": r[2]} for r in rows[:6]],
+    }
 
 
 def _densify_topk_normalize(dense, names, prune=0.02, top_k=4):
@@ -346,6 +393,11 @@ def compute(data, model, timeout):
                 arr = np.asarray(col, dtype=np.float32)  # (Ns,)
                 src_dense[:, name_to_col[gname]] = arr
 
+        # quality of UniRig's RAW prediction, in its own output frame (before our
+        # transfer) — isolates model/skeleton-feeding quality from transfer error
+        src_quality = _dominant_quality(src_verts, src_dense, bone_names, sk.get("joints", {}))
+        print(f"[ai-weights] src_quality={src_quality}", flush=True)
+
     # 5. transfer onto our full-res verts
     t_xfer = time.time()
     dst_dense, orient = _transfer_weights(src_verts, src_dense, verts)
@@ -367,6 +419,7 @@ def compute(data, model, timeout):
             "bones_with_weights": bones_with,
             "model": model,
             "orientation": orient,
+            "src_quality": src_quality,
             "timing": {
                 "build_glb_s": build_s,
                 "inference_s": infer_s,

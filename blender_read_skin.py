@@ -10,10 +10,13 @@ Output JSON:
     "names":    [bone/group names present on the armature],
     "vertices": [[x,y,z], ...]   # world-space verts of the skinned mesh
     "groups":   { groupName: [w_0, w_1, ..., w_{Ns-1}], ... }  # dense per vertex
+    "joints":   { boneName: {"head":[x,y,z], "tail":[x,y,z]} }  # result armature
   }
 
 The caller NN-transfers these (in normalized space) onto our full-res mesh, so
 the absolute coordinate frame here does not matter — only relative geometry.
+`joints` lets the caller measure skinning quality in the result's OWN space
+(dominant-bone centroid vs bone), isolating prediction quality from transfer.
 """
 import os
 import sys
@@ -47,6 +50,21 @@ def pick_skinned_mesh():
     return best
 
 
+def read_joints():
+    """World-space head/tail of every bone in the result armature (for caller-
+    side quality diagnostics in the result's own coordinate frame)."""
+    out = {}
+    for obj in bpy.context.scene.objects:
+        if obj.type != "ARMATURE":
+            continue
+        mw = obj.matrix_world
+        for b in obj.data.bones:
+            h = mw @ b.head_local
+            t = mw @ b.tail_local
+            out[b.name] = {"head": [h.x, h.y, h.z], "tail": [t.x, t.y, t.z]}
+    return out
+
+
 def read(result_path, out_json):
     reset_scene()
     load_any(result_path)
@@ -73,6 +91,7 @@ def read(result_path, out_json):
         "names": group_names,
         "vertices": vertices,
         "groups": groups,
+        "joints": read_joints(),
     }
     with open(out_json, "w") as f:
         json.dump(out, f)
