@@ -45,9 +45,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # fitness check fails and it exits unhealthy (jobs never dispatch). cu128 torch
 # 2.7 ships Blackwell kernels — the same choice our working hy-motion worker
 # made. torch's pip wheel bundles its own CUDA 12.8 libs, so the cu12.4 base is
-# irrelevant. numpy MUST stay 1.26.x for UniRig.
+# irrelevant. numpy MUST stay 1.26.x for UniRig. torchaudio MUST match torch's
+# ABI: SkinTokens pulls transformers>=4.57, whose modeling_utils imports
+# torchaudio (Parakeet RNNT loss) at load; the base image's stale torchaudio.so
+# then fails with "undefined symbol _ZNK5torch8autograd4Node4nameEv". (UniRig
+# pins transformers 4.51.3 and never hit this.)
 RUN pip install --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128 \
+    && pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128 \
     && pip install --no-cache-dir numpy==1.26.4
 
 # GPU extension wheels (prebuilt; nothing compiles). pyg + flash-attn matched to
