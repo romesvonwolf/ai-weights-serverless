@@ -125,6 +125,25 @@ RUN if [ -f ${SKINTOKENS_DIR}/requirements.txt ]; then \
       && pip install --no-cache-dir -r /tmp/st_extra.txt || echo "WARN: SkinTokens deps failed; unirig still available"; \
     fi
 
+# Bake SkinTokens pretrained checkpoints into the image: TokenRig GRPO model
+# (grpo_1400.ckpt, ~1.1GB) + FSQ-CVAE skin decoder (last.ckpt, ~487MB) + the
+# Qwen3-0.6B *config* (the trained weights live inside the ckpt; download.py
+# ignores *.bin/*.safetensors). download.py uses local_dir="." so it MUST run
+# from SKINTOKENS_DIR to produce the exact experiments/.../*.ckpt layout the
+# loader hard-codes. FATAL if the ckpts are missing afterwards, so a broken
+# build fails loudly instead of shipping a worker that 500s at runtime with
+# "checkpoint not found" (matches the no-fallback policy). A failed build just
+# leaves the previous good image serving, so this can't regress UniRig.
+RUN if [ -f ${SKINTOKENS_DIR}/download.py ]; then \
+      cd ${SKINTOKENS_DIR} \
+      && python download.py --model \
+      && pip install --no-cache-dir numpy==1.26.4 \
+      && test -f experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt \
+      && test -f experiments/skin_vae_2_10_32768/last.ckpt \
+      && echo "=== SkinTokens checkpoints present ===" \
+      && ls -lh experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt experiments/skin_vae_2_10_32768/last.ckpt; \
+    else echo "ERROR: SkinTokens/download.py missing — cannot bake checkpoints"; exit 1; fi
+
 # torch.load weights_only fix (DETERMINISTIC — primary). torch>=2.6 defaults
 # torch.load(weights_only=True) and Lightning forwards it explicitly, so UniRig's
 # checkpoints (which embed a python-box Box) fail to unpickle ("Unsupported
