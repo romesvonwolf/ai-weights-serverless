@@ -34,7 +34,6 @@ Pipeline (per job):
 
 import os
 import sys
-import glob
 import json
 import time
 import gzip
@@ -197,13 +196,57 @@ def _best_orientation(src_verts, dst_verts, num=16384):
     }
 
 
-def _transfer_weights(src_verts, src_weights, dst_verts, k=6, alpha=8.0):
-    """Transfer weights from src (UniRig's faithfully-sampled cloud, read from
-    predict_skin.npz) to dst (our full-res mesh). Both are the SAME shape, so we
-    follow UniRig's merge exactly: uniform-normalize both (proportions preserved),
-    pick the axis frame (identity unless a real flip clearly wins), then a
-    distance-weighted nearest-neighbour blend. alpha is in normalized units where
-    the longest axis spans [-1,1].
+def _anchor_points(src_joints, dst_joints):
+    """Shared-skeleton correspondences: bone head+tail positions present in both
+    the source (model output) frame and our input frame, as (src_pts, dst_pts)."""
+    sp, dp = [], []
+    for nm, sj in src_joints.items():
+        dj = dst_joints.get(nm)
+        if not dj:
+            continue
+        for key in ("head", "tail"):
+            if key in sj and key in dj:
+                sp.append(sj[key])
+                dp.append(dj[key])
+    if not sp:
+        return None, None
+    return np.asarray(sp, dtype=np.float64), np.asarray(dp, dtype=np.float64)
+
+
+def _fit_peraxis_affine(src_pts, dst_pts):
+    """Per-axis least-squares affine dst ≈ a*src + b (a,b are (3,)). Diagonal
+    (no rotation) because, after the discrete frame is fixed, source and target
+    differ only by UniRig's per-axis normalize (a center + per-axis scale), which
+    this exactly inverts. Solved independently per axis."""
+    a = np.ones(3, dtype=np.float64)
+    b = np.zeros(3, dtype=np.float64)
+    for ax in range(3):
+        s = src_pts[:, ax]
+        d = dst_pts[:, ax]
+        sm = s.mean()
+        dm = d.mean()
+        var = float(((s - sm) ** 2).sum())
+        if var < 1e-12:
+            a[ax] = 1.0
+            b[ax] = dm - sm
+        else:
+            a[ax] = float(((s - sm) * (d - dm)).sum()) / var
+            b[ax] = dm - a[ax] * sm
+    return a, b
+
+
+def _transfer_weights(src_verts, src_weights, dst_verts, src_joints, dst_joints, k=6, alpha=8.0):
+    """Transfer weights from src (UniRig's predicted skin on its sampled proxy)
+    to dst (our full-res mesh).
+
+    The proxy is UniRig's input mesh after a per-axis `normalize_into [-1,1]`, so
+    it is a NON-uniformly scaled (inflated) version of our mesh — a plain
+    normalized NN match then drags torso verts onto limb proxy verts (legs were
+    the worst). But src and dst share the SAME skeleton, so we register them with
+    the bones as anchors: pick the discrete frame (uniform-space search), then fit
+    a per-axis affine from the shared bone head/tail positions that maps the proxy
+    back onto our mesh, EXACTLY inverting UniRig's normalize. The distance-weighted
+    NN blend then runs in our own coordinate frame.
 
     src_weights: (Ns, J) dense. Returns (Nd, J) dense and an orientation diag.
     """
@@ -212,16 +255,38 @@ def _transfer_weights(src_verts, src_weights, dst_verts, k=6, alpha=8.0):
     de = dst_verts.max(axis=0) - dst_verts.min(axis=0)
     orient["src_extent"] = [round(float(x), 3) for x in se]
     orient["dst_extent"] = [round(float(x), 3) for x in de]
-    su = _normalize_uniform(src_verts.astype(np.float64))
-    du = _normalize_uniform(dst_verts.astype(np.float64))
-    sv = su[:, perm] * np.asarray(signs, dtype=np.float64)
-    k = min(k, len(sv))
-    tree = cKDTree(sv)
-    dist, idx = tree.query(du, k=k)
+    signs = np.asarray(signs, dtype=np.float64)
+
+    src = src_verts.astype(np.float64)[:, perm] * signs
+    dst = dst_verts.astype(np.float64)
+    sp, dp = _anchor_points(src_joints, dst_joints)
+    if sp is not None and len(sp) >= 3:
+        spo = sp[:, perm] * signs
+        a, b = _fit_peraxis_affine(spo, dp)
+        src = src * a + b
+        orient["affine_scale"] = [round(float(x), 4) for x in a]
+        # residual: how well the anchors line up after the fit (sanity)
+        res = np.linalg.norm((spo * a + b) - dp, axis=1).mean()
+        diag = float(np.linalg.norm(dst.max(0) - dst.min(0))) or 1.0
+        orient["anchor_residual"] = round(float(res / diag), 4)
+        orient["anchors"] = int(len(sp))
+        space = "ourframe"
+    else:
+        # no usable skeleton anchors: fall back to uniform-normalized match
+        src = _normalize_uniform(src)
+        dst = _normalize_uniform(dst)
+        space = "uniform"
+    orient["transfer_space"] = space
+
+    # distance weighting in a scale-consistent space (normalize both by dst diag)
+    diag = float(np.linalg.norm(dst.max(0) - dst.min(0))) or 1.0
+    k = min(k, len(src))
+    tree = cKDTree(src)
+    dist, idx = tree.query(dst, k=k)
     if k == 1:
         dist = dist[:, None]
         idx = idx[:, None]
-    w = np.exp(-alpha * dist)
+    w = np.exp(-alpha * dist / diag)
     w_sum = w.sum(axis=1, keepdims=True)
     w_sum[w_sum < 1e-12] = 1e-12
     out = (src_weights[idx] * w[..., None]).sum(axis=1) / w_sum
@@ -314,16 +379,6 @@ def _run(cmd, cwd=None, timeout=1800, env=None, expect=None):
     return proc
 
 
-def _newest(*patterns):
-    """Newest existing file matching any of the (recursive) glob patterns."""
-    files = []
-    for p in patterns:
-        files.extend(f for f in glob.glob(p, recursive=True) if os.path.isfile(f))
-    if not files:
-        return None
-    return max(files, key=os.path.getmtime)
-
-
 def _run_unirig(in_glb, work, timeout):
     out_fbx = os.path.join(work, "skin.fbx")
     # generate_skin.sh chains extract.sh + run.py via `eval` and then always
@@ -342,88 +397,7 @@ def _run_unirig(in_glb, work, timeout):
             f"--- stdout tail ---\n{(proc.stdout or '')[-3000:]}\n"
             f"--- stderr tail ---\n{(proc.stderr or '')[-3000:]}"
         )
-    # The .fbx is a re-exported DISPLAY mesh whose proportions differ from the
-    # sampled point cloud the weights actually index (we measured depth/height
-    # 0.71 in the fbx vs 0.21 in our mesh), which scrambled the NN transfer.
-    # UniRig's own merge reads predict_skin.npz instead: `vertices` is the
-    # faithfully sampled (uniform-normalized) cloud and `skin` is (N,J) for it.
-    # raw_data.npz carries the joint NAMES in skin-column order. The npz can land
-    # in a few places (results/ or tmp/ under UniRig, or beside the input in our
-    # work dir), so search a broad set of roots and take the newest match.
-    roots = [work, os.path.dirname(in_glb), UNIRIG_DIR, os.getcwd(), "/tmp"]
-    def find(name):
-        return _newest(*[os.path.join(r, "**", name) for r in roots if r])
-    predict_skin = find("predict_skin.npz")
-    raw_data = find("raw_data.npz")
-    if not predict_skin or not raw_data:
-        listing = []
-        for r in roots:
-            if r:
-                listing += glob.glob(os.path.join(r, "**", "*.npz"), recursive=True)
-        listing = "\n".join(sorted(set(listing))[:40]) or "(no .npz anywhere)"
-        raise RuntimeError(
-            f"UniRig npz outputs not found (predict_skin={predict_skin}, raw_data={raw_data}).\n"
-            f"--- *.npz under {roots} ---\n{listing}"
-        )
-    return {"predict_skin": predict_skin, "raw_data": raw_data}, "AI_UNIRIG"
-
-
-def _read_unirig_npz(predict_skin_path, raw_data_path, bone_names, J):
-    """Read UniRig's predicted skin from its npz outputs (NOT the display fbx).
-
-    predict_skin.npz: `vertices` (Ns,3) sampled+uniform-normalized, `skin` (Ns,Ju)
-    raw_data.npz:     `names` (Ju,) joint names in skin-column order, plus
-                      `joints`/`tails` (Ju,3) in the SAME normalized frame.
-
-    Returns (src_verts (Ns,3) f32, src_dense (Ns,J) f32 in OUR bone order,
-             joints_dict {name:{head,tail}}, matched_count).
-    """
-    ps = np.load(predict_skin_path, allow_pickle=True)
-    rd = np.load(raw_data_path, allow_pickle=True)
-    skin = np.asarray(ps["skin"], dtype=np.float64)
-
-    # sampled verts the skin indexes: prefer predict_skin.npz `vertices`, else
-    # fall back to raw_data.npz `vertices` (must match the skin row count).
-    src_verts = None
-    if "vertices" in ps.files and ps["vertices"].ndim == 2:
-        src_verts = np.asarray(ps["vertices"], dtype=np.float64)
-    if src_verts is None and "vertices" in rd.files:
-        src_verts = np.asarray(rd["vertices"], dtype=np.float64)
-    if src_verts is None:
-        raise RuntimeError("no `vertices` in predict_skin.npz or raw_data.npz")
-
-    # orient skin to (Ns, Ju) against whichever axis equals the vertex count
-    Ns = len(src_verts)
-    if skin.shape[0] != Ns and skin.shape[1] == Ns:
-        skin = skin.T
-    if skin.shape[0] != Ns:
-        raise RuntimeError(f"skin rows {skin.shape} != vertices {Ns}")
-    Ju = skin.shape[1]
-
-    names = [str(x) for x in rd["names"]] if "names" in rd.files else []
-    rd_joints = np.asarray(rd["joints"], dtype=np.float64) if "joints" in rd.files else None
-    rd_tails = (np.asarray(rd["tails"], dtype=np.float64)
-                if "tails" in rd.files and rd["tails"].shape != () else None)
-
-    name_to_col = {nm: i for i, nm in enumerate(bone_names)}
-    dense = np.zeros((Ns, J), dtype=np.float32)
-    matched = 0
-    for ci in range(min(Ju, len(names))):
-        nm = names[ci]
-        if nm in name_to_col:
-            matched += 1
-            dense[:, name_to_col[nm]] = skin[:, ci]
-
-    joints = {}
-    if rd_joints is not None:
-        for ci, nm in enumerate(names):
-            if ci >= len(rd_joints):
-                break
-            head = rd_joints[ci]
-            tail = rd_tails[ci] if (rd_tails is not None and ci < len(rd_tails)) else head
-            joints[nm] = {"head": head.tolist(), "tail": tail.tolist()}
-
-    return src_verts.astype(np.float32), dense, joints, matched
+    return out_fbx, "AI_UNIRIG"
 
 
 def _run_skintokens(in_glb, work, timeout):
@@ -471,40 +445,43 @@ def compute(data, model, timeout):
         _run([PYBIN, os.path.join(HERE, "blender_build_input.py"), mesh_json, in_glb], timeout=600, expect=in_glb)
         build_s = round(time.time() - t_build, 2)
 
-        # 3. run the chosen skinning model + read its predicted skin
+        # 3. run the chosen skinning model
         t_infer = time.time()
         if model == "skintokens":
             result_path, method = _run_skintokens(in_glb, work, timeout)
-            infer_s = round(time.time() - t_infer, 2)
-            # SkinTokens emits a glb; read verts + per-bone vertex groups via bpy
-            skin_json = os.path.join(work, "skin.json")
-            _run([PYBIN, os.path.join(HERE, "blender_read_skin.py"), result_path, skin_json], timeout=600, expect=skin_json)
-            with open(skin_json) as f:
-                sk = json.load(f)
-            src_verts = np.asarray(sk["vertices"], dtype=np.float32)
-            name_to_col = {nm: i for i, nm in enumerate(bone_names)}
-            src_dense = np.zeros((len(src_verts), J), dtype=np.float32)
-            matched = 0
-            for gname, col in sk["groups"].items():
-                if gname in name_to_col:
-                    matched += 1
-                    src_dense[:, name_to_col[gname]] = np.asarray(col, dtype=np.float32)
-            src_joints = sk.get("joints", {})
         else:
-            npz, method = _run_unirig(in_glb, work, timeout)
-            infer_s = round(time.time() - t_infer, 2)
-            # read the faithfully-sampled cloud + skin from npz (NOT the fbx mesh)
-            src_verts, src_dense, src_joints, matched = _read_unirig_npz(
-                npz["predict_skin"], npz["raw_data"], bone_names, J)
+            result_path, method = _run_unirig(in_glb, work, timeout)
+        infer_s = round(time.time() - t_infer, 2)
+
+        # 4. read the skinned result (fbx/glb): verts + per-bone vertex groups +
+        # the result's own bone head/tail positions (consistent in ONE frame).
+        skin_json = os.path.join(work, "skin.json")
+        _run([PYBIN, os.path.join(HERE, "blender_read_skin.py"), result_path, skin_json], timeout=600, expect=skin_json)
+        with open(skin_json) as f:
+            sk = json.load(f)
+        src_verts = np.asarray(sk["vertices"], dtype=np.float32)
+        name_to_col = {nm: i for i, nm in enumerate(bone_names)}
+        src_dense = np.zeros((len(src_verts), J), dtype=np.float32)
+        matched = 0
+        for gname, col in sk["groups"].items():
+            if gname in name_to_col:
+                matched += 1
+                src_dense[:, name_to_col[gname]] = np.asarray(col, dtype=np.float32)
+        src_joints = sk.get("joints", {})
 
         # quality of the RAW prediction, in its own output frame (before our
         # transfer) — isolates model/skeleton-feeding quality from transfer error
         src_quality = _dominant_quality(src_verts, src_dense, bone_names, src_joints)
         print(f"[ai-weights] src_quality={src_quality} matched={matched}/{J} src_verts={len(src_verts)}", flush=True)
 
-    # 5. transfer onto our full-res verts
+    # our input skeleton (same frame as our mesh) — the anchor for registering
+    # the model's proxy back onto our mesh, and the ground truth for dst_quality.
+    our_joints = {b["name"]: {"head": b["head"], "tail": b["tail"]}
+                  for b in bones if b.get("head") and b.get("tail")}
+
+    # 5. transfer onto our full-res verts (skeleton-anchored registration)
     t_xfer = time.time()
-    dst_dense, orient = _transfer_weights(src_verts, src_dense, verts)
+    dst_dense, orient = _transfer_weights(src_verts, src_dense, verts, src_joints, our_joints)
     weights = _densify_topk_normalize(dst_dense, bone_names)
     xfer_s = round(time.time() - t_xfer, 2)
     print(f"[ai-weights] orientation={orient}", flush=True)
@@ -512,8 +489,6 @@ def compute(data, model, timeout):
     # definitive metric: post-transfer quality on OUR mesh, scored against OUR
     # input skeleton (same frame, no round-trip) — directly comparable to
     # src_quality so we can see how much the transfer degrades the prediction.
-    our_joints = {b["name"]: {"head": b["head"], "tail": b["tail"]}
-                  for b in bones if b.get("head") and b.get("tail")}
     dst_quality = _dominant_quality(verts, dst_dense, bone_names, our_joints)
     print(f"[ai-weights] dst_quality={dst_quality}", flush=True)
 
