@@ -236,56 +236,86 @@ def _fit_peraxis_affine(src_pts, dst_pts):
     return a, b
 
 
-def _remap_by_skeleton_position(src_joints, dst_joints, bone_names):
-    """Recover the bone correspondence by SKELETON POSITION when a model drops our
-    names.
+def _frame_match(src_blocks, src_keys, dst_blocks, dst_keys):
+    """Generic position matcher used to recover a bone correspondence when a model
+    drops our names. src_blocks / dst_blocks are equal-length lists of (N,3) point
+    arrays describing each bone (1 block = a centroid; 2 blocks = head+tail).
 
-    UniRig is fed our skeleton and preserves our bone names, so its output vertex
-    groups map onto our columns directly. SkinTokens/TokenRig instead encodes the
-    skeleton into GEOMETRIC tokens and reconstructs it, so the reconstructed bones
-    carry generic/foreign names → zero name matches → all weight collapses onto a
-    single fallback bone.
-
-    Both skeletons share the SAME structure (same bones, same proportions) but sit
-    in different frames (each model's own normalization). So: uniform-normalize
-    both joint clouds (head+tail, proportions preserved), search the discrete axis
-    frame (perm+sign) that best aligns them, and 1:1 assign each model bone to our
-    nearest bone (Hungarian on the 6-D head+tail vector). Returns a
-    {model_bone_name: our_bone_name} dict; the caller renames groups + joints to
-    OUR names so the downstream skeleton-anchored transfer runs unchanged.
+    Uniform-normalize each side over ALL its points (shared center + max-extent
+    scale, proportions preserved), search the 24 discrete axis frames (perm+sign)
+    applied to the src blocks, and 1:1 Hungarian-assign src→dst by summed per-block
+    distance. Returns {src_key: dst_key} for the best frame.
     """
-    sk_names = [n for n in src_joints
-                if isinstance(src_joints[n], dict)
-                and "head" in src_joints[n] and "tail" in src_joints[n]]
-    our_names = [n for n in bone_names
-                 if n in dst_joints and "head" in dst_joints[n] and "tail" in dst_joints[n]]
-    if len(sk_names) < 2 or len(our_names) < 2:
+    if len(src_keys) < 2 or len(dst_keys) < 2:
         return {}
 
-    def feats(joints, names):
-        h = np.array([joints[n]["head"] for n in names], dtype=np.float64)
-        t = np.array([joints[n]["tail"] for n in names], dtype=np.float64)
-        pts = np.vstack([h, t])
-        lo, hi = pts.min(0), pts.max(0)
+    def norm(blocks):
+        allpts = np.vstack(blocks)
+        lo, hi = allpts.min(0), allpts.max(0)
         c = (lo + hi) * 0.5
         s = float((hi - lo).max()) * 0.5 or 1.0
-        return (h - c) / s, (t - c) / s
+        return [(b.astype(np.float64) - c) / s for b in blocks]
 
-    sh, st = feats(src_joints, sk_names)
-    oh, ot = feats(dst_joints, our_names)
-    o6 = np.hstack([oh, ot])  # (No, 6)
-
+    sn = norm(src_blocks)
+    dcat = np.hstack(norm(dst_blocks))  # (No, 3B)
     best = None
     for perm in itertools.permutations((0, 1, 2)):
         for signs in [(x, y, z) for x in (1, -1) for y in (1, -1) for z in (1, -1)]:
             sg = np.asarray(signs, dtype=np.float64)
-            s6 = np.hstack([sh[:, perm] * sg, st[:, perm] * sg])  # (Ns, 6)
-            d = np.linalg.norm(s6[:, None, :] - o6[None, :, :], axis=2)  # Ns x No
+            scat = np.hstack([b[:, perm] * sg for b in sn])  # (Ns, 3B)
+            d = np.linalg.norm(scat[:, None, :] - dcat[None, :, :], axis=2)  # Ns x No
             ri, ci = linear_sum_assignment(d)
             cost = float(d[ri, ci].mean())
             if best is None or cost < best[0]:
-                best = (cost, {sk_names[r]: our_names[c] for r, c in zip(ri, ci)})
+                best = (cost, {src_keys[r]: dst_keys[c] for r, c in zip(ri, ci)})
     return best[1] if best else {}
+
+
+def _remap_by_joints(src_joints, dst_joints, bone_names):
+    """Name-recovery when the result HAS an armature: match by head+tail position.
+
+    UniRig is fed our skeleton and preserves our names, so this is never needed for
+    it. SkinTokens/TokenRig encodes the skeleton into GEOMETRIC tokens and rebuilds
+    it, so any reconstructed armature carries foreign names — match it to ours by
+    the 6-D head+tail vector.
+    """
+    sk = [n for n in src_joints if isinstance(src_joints[n], dict)
+          and "head" in src_joints[n] and "tail" in src_joints[n]]
+    ours = [n for n in bone_names if n in dst_joints
+            and "head" in dst_joints[n] and "tail" in dst_joints[n]]
+    if len(sk) < 2 or len(ours) < 2:
+        return {}
+    sh = np.array([src_joints[n]["head"] for n in sk])
+    st = np.array([src_joints[n]["tail"] for n in sk])
+    oh = np.array([dst_joints[n]["head"] for n in ours])
+    ot = np.array([dst_joints[n]["tail"] for n in ours])
+    return _frame_match([sh, st], sk, [oh, ot], ours)
+
+
+def _remap_by_centroids(src_verts, sk_groups, dst_joints, bone_names):
+    """Name-recovery when the result has NO armature (SkinTokens --use_transfer
+    bakes weights onto our mesh as vertex groups but exports no joints): locate
+    each output group by its weight-weighted vertex centroid and match those to our
+    bone MIDPOINTS. The exported mesh is already in our mesh's frame, so the
+    downstream NN transfer needs no skeleton anchors — only the names must align.
+    """
+    sv = np.asarray(src_verts, dtype=np.float64)
+    sk_keys, sk_c = [], []
+    for g, col in sk_groups.items():
+        w = np.asarray(col, dtype=np.float64)
+        m = float(w.sum())
+        if m > 1e-6:
+            sk_keys.append(g)
+            sk_c.append((sv * w[:, None]).sum(0) / m)
+    our_keys, our_m = [], []
+    for n in bone_names:
+        j = dst_joints.get(n)
+        if j and "head" in j and "tail" in j:
+            our_keys.append(n)
+            our_m.append((np.asarray(j["head"], float) + np.asarray(j["tail"], float)) * 0.5)
+    if len(sk_keys) < 2 or len(our_keys) < 2:
+        return {}
+    return _frame_match([np.array(sk_c)], sk_keys, [np.array(our_m)], our_keys)
 
 
 def _transfer_weights(src_verts, src_weights, dst_verts, src_joints, dst_joints, k=6, alpha=8.0):
@@ -514,7 +544,17 @@ def compute(data, model, timeout):
             sk = json.load(f)
         src_verts = np.asarray(sk["vertices"], dtype=np.float32)
         name_to_col = {nm: i for i, nm in enumerate(bone_names)}
-        src_joints = sk.get("joints", {})
+        src_joints = sk.get("joints", {}) or {}
+        sk_groups = sk.get("groups", {}) or {}
+
+        # what the result actually carried (helps diagnose name-less models).
+        sk_structure = {
+            "n_groups": len(sk_groups),
+            "group_names": list(sk_groups.keys())[:12],
+            "n_joints": len(src_joints),
+            "joint_names": list(src_joints.keys())[:12],
+        }
+        print(f"[ai-weights] sk_structure={sk_structure}", flush=True)
 
         # our input skeleton (same frame as our mesh) — the anchor for registering
         # the model's proxy back onto our mesh, the ground truth for dst_quality,
@@ -526,34 +566,43 @@ def compute(data, model, timeout):
         # is fed our skeleton and preserves our names, so this matches directly.
         src_dense = np.zeros((len(src_verts), J), dtype=np.float32)
         matched = 0
-        for gname, col in sk["groups"].items():
+        for gname, col in sk_groups.items():
             if gname in name_to_col:
                 matched += 1
                 src_dense[:, name_to_col[gname]] = np.asarray(col, dtype=np.float32)
 
         # SkinTokens/TokenRig rebuilds the skeleton from geometric tokens and drops
-        # our names → 0 name matches. Recover the mapping by skeleton POSITION and
-        # rename BOTH the weight groups and the joints to our names, so the
-        # skeleton-anchored transfer below works exactly as it does for UniRig.
+        # our names → 0 name matches. Recover the mapping by POSITION: prefer the
+        # reconstructed armature (head+tail); if it exported none, fall back to each
+        # group's weight-weighted vertex centroid. Then rename groups (and joints,
+        # if any) to OUR names so the transfer below works as it does for UniRig.
         remap_applied = False
-        if matched == 0 and src_joints and our_joints:
-            remap = _remap_by_skeleton_position(src_joints, our_joints, bone_names)
+        remap_mode = None
+        if matched == 0 and our_joints:
+            remap = _remap_by_joints(src_joints, our_joints, bone_names) if src_joints else {}
+            if remap:
+                remap_mode = "joints"
+            else:
+                remap = _remap_by_centroids(src_verts, sk_groups, our_joints, bone_names)
+                if remap:
+                    remap_mode = "centroids"
             if remap:
                 remap_applied = True
                 src_dense = np.zeros((len(src_verts), J), dtype=np.float32)
                 matched = 0
-                for gname, col in sk["groups"].items():
+                for gname, col in sk_groups.items():
                     onm = remap.get(gname)
                     if onm in name_to_col:
                         src_dense[:, name_to_col[onm]] += np.asarray(col, dtype=np.float32)
                         matched += 1
-                src_joints = {remap[g]: src_joints[g] for g in remap if g in src_joints}
-                print(f"[ai-weights] skeleton remap by position → matched {matched}/{J} bones", flush=True)
+                if src_joints:
+                    src_joints = {remap[g]: src_joints[g] for g in remap if g in src_joints}
+                print(f"[ai-weights] skeleton remap ({remap_mode}) → matched {matched}/{J} bones", flush=True)
 
         # quality of the RAW prediction, in its own output frame (before our
         # transfer) — isolates model/skeleton-feeding quality from transfer error
         src_quality = _dominant_quality(src_verts, src_dense, bone_names, src_joints)
-        print(f"[ai-weights] src_quality={src_quality} matched={matched}/{J} src_verts={len(src_verts)} remap={remap_applied}", flush=True)
+        print(f"[ai-weights] src_quality={src_quality} matched={matched}/{J} src_verts={len(src_verts)} remap={remap_mode}", flush=True)
 
     # 5. transfer onto our full-res verts (skeleton-anchored registration)
     t_xfer = time.time()
@@ -580,6 +629,8 @@ def compute(data, model, timeout):
             "result_verts": int(len(src_verts)),
             "matched_groups": matched,
             "remap_applied": remap_applied,
+            "remap_mode": remap_mode,
+            "sk_structure": sk_structure,
             "bones_with_weights": bones_with,
             "model": model,
             "orientation": orient,
